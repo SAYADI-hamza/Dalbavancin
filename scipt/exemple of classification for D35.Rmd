@@ -1,0 +1,424 @@
+---
+title: "D35 classification"
+author: "Hamza Sayadi"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+
+# Package
+```{r}
+library(dplyr)
+library(themis)
+library(tidyverse)
+library(tidymodels)
+library(DataExplorer)
+library(naniar)
+library(finetune)
+library(stacks)
+```
+
+
+# Concentrations <1st and >99th percentile
+```{r}
+quantiles <- quantile(data_Car_dalba_J1_J15$conc_time_840, probs = c(0.01, 0.99))
+
+data_Car_dalba_J1_J15 <- data_Car_dalba_J1_J15 %>%
+  filter(conc_time_840 > quantiles[1], conc_time_840 < quantiles[2])
+```
+
+
+# Data splitting 
+```{r}
+
+set.seed(1234)
+dalba_split_J1_J15_class <- initial_split(data_Car_dalba_J1_J15, strata = conc_time_840, prop=3/4)
+dalba_ml_train_J1_J15_class  <- training(dalba_split_J1_J15_class) 
+dalba_ml_test_J1_J15_class  <- testing(dalba_split_J1_J15_class)
+
+```
+
+
+
+
+# Classification 
+```{r}
+
+# Pré-processing : 
+dalba_ml_rec_J1_J15_class <- recipe(event_840 ~ 
+                            conc_time_336 + DFGe + ID + ALB + WT + AGE + CMI,
+                            data = dalba_ml_train_J1_J15_class) %>% 
+  update_role(ID, new_role = "ID") %>% 
+  step_rm(ALB) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_mutate(event = as.factor(event),
+    conc_DFGe_ratio = conc_time_336 / DFGe,  
+    conc_WT_ratio = conc_time_336 / WT,  
+    conc_AGE_ratio = conc_time_336 / AGE,
+    DFGe_WT_ratio = DFGe / WT,  
+    DFGe_AGE_ratio = DFGe / AGE
+  ) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_smote(event_840, over_ratio = 1)
+
+dalba_ml_rec_prep_J1_J15_class <- prep(dalba_ml_rec_J1_J15_class)
+
+dalba_train_recipe_J1_J15_class <- bake(dalba_ml_rec_prep_J1_J15_class, new_data = NULL)
+dalba_test_recipe_J1_J15_class <- bake(dalba_ml_rec_prep_J1_J15_class, new_data = dalba_ml_test_J1_J15_class)
+```
+
+
+
+
+
+## XGBoost 
+```{r}
+xgb_spec <- boost_tree(mode = "classification",  
+                       mtry = tune(),
+                       trees = tune(),
+                       min_n = tune(),
+                       sample_size = tune(),
+                       tree_depth = tune(),
+                       learn_rate = tune()) %>% 
+  set_engine("xgboost")
+
+xgb_wf_J1_J15_class <- workflow() %>%
+  add_recipe(dalba_ml_rec_J1_J15_class) %>%
+  add_model(xgb_spec)
+
+set.seed(2345)
+folds <- vfold_cv(dalba_ml_train_J1_J15_class, strata = event_840)  
+
+set.seed(345)
+tune_xgb_J1_J15_class <- tune_grid(
+  xgb_wf_J1_J15_class,
+  resamples = folds,
+  grid = 60,
+  metrics = metric_set(roc_auc, accuracy, f_meas)
+)
+
+best_xgb_J1_J15_class <- select_best(tune_xgb_J1_J15_class, metric = "f_meas")
+
+final_xgb_J1_J15_class <- finalize_model(
+  xgb_spec,
+  best_xgb_J1_J15_class
+)
+
+final_wf_xgb_J1_J15_class <- workflow() %>%
+  add_recipe(dalba_ml_rec_J1_J15_class) %>%
+  add_model(final_xgb_J1_J15_class)%>% 
+  fit(dalba_ml_train_J1_J15_class)
+
+```
+
+
+## Cross validation
+```{r}
+
+set.seed(456)
+folds_cv <- vfold_cv(dalba_ml_train_J1_J15_class, strata = event_840)  # Stratification
+
+set.seed(123)
+xgb_rs_J1_J15_class <- fit_resamples(object = final_wf_xgb_J1_J15_class, 
+                                     resamples = folds_cv, 
+                                     control = control_resamples(verbose = TRUE, save_pred = TRUE))
+
+
+xgb_rs_J1_J15_class%>%collect_metrics()
+```
+
+
+```{r}
+xgb_rs_J1_J15_class%>% collect_predictions() %>%
+  conf_mat(event, .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+
+```{r}
+fit_workflow_J35_XGb <- fit(final_wf_xgb_J1_J15_class, dalba_ml_train_J1_J15_class)
+
+```
+
+
+
+
+
+## Linear model
+```{r}
+lm_spec <- logistic_reg(mode = "classification",
+                        penalty = tune(),
+                        mixture = 1
+                        ) %>% set_engine("glmnet")
+
+lm_wf<- workflow() %>%
+  add_recipe(dalba_ml_rec_J1_J15_class) %>%
+  add_model(lm_spec)
+
+narrower_penalty <- penalty(range = c(-3, 0))
+
+set.seed(345)
+tune_lm <- tune_grid(
+  lm_wf,
+  resamples = folds,
+  grid = 10,
+  metrics = metric_set(roc_auc, accuracy, f_meas)
+)
+
+best_penalty <- 
+  tune_lm %>%
+  select_best(metric = "f_meas")
+
+final_lm <- finalize_model(
+  lm_spec,
+  best_penalty
+)
+
+final_wf_lm <- workflow() %>%
+  add_recipe(dalba_ml_rec_J1_J15_class) %>%
+  add_model(final_lm)%>% 
+  fit(dalba_ml_train_J1_J15_class)
+
+```
+
+
+```{r}
+set.seed(123)
+lm_rs<- fit_resamples(object = final_wf_lm, 
+                      resamples = folds_cv, 
+                      control = control_resamples(verbose=TRUE, save_pred = TRUE, save_workflow = TRUE))
+
+
+lm_rs %>% collect_metrics()
+```
+
+
+```{r}
+lm_rs %>% collect_predictions() %>%
+  conf_mat(event, .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+
+```{r}
+fit_workflow_J35_lm <- fit(final_wf_lm, dalba_ml_train_J1_J15_class)
+```
+
+
+
+
+## MARS model
+```{r}
+
+mars_spec <- mars(mode = "classification",
+                        num_terms = tune(),
+                        prod_degree = tune()
+                        ) %>% set_engine("earth")
+
+
+mars_wf<- workflow() %>%
+  add_recipe(dalba_ml_rec_J1_J15_class) %>%
+  add_model(mars_spec)
+
+set.seed(345)
+tune_mars <- tune_grid(
+  mars_wf,
+  resamples = folds,
+  grid = 20,
+  metrics = metric_set(roc_auc, accuracy, f_meas)
+)
+
+best_rmse_mars <- select_best(tune_mars, metric = "f_meas")
+
+final_mars <- finalize_model(
+  mars_spec,
+  best_rmse_mars
+)
+
+
+final_wf_mars <- workflow() %>%
+  add_recipe(dalba_ml_rec_J1_J15_class) %>%
+  add_model(final_mars) %>% 
+  fit(dalba_ml_train_J1_J15_class)
+
+set.seed(123)
+mars_rs<- fit_resamples(object = final_wf_mars, 
+                        resamples = folds_cv, 
+                        control = control_resamples(verbose=TRUE, save_pred = TRUE, save_workflow = TRUE))
+
+mars_rs %>% collect_metrics()
+```
+
+
+```{r}
+mars_rs %>% 
+  collect_predictions() %>%
+  conf_mat(event, .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+
+```{r}
+fit_workflow_J35_mars <- fit(final_wf_mars, dalba_ml_train_J1_J15_class)
+```
+
+
+
+## SVM polynomial model 
+```{r}
+
+svm_spec <- svm_linear(mode = "classification",
+                        cost = tune()
+                        ) %>% set_engine("kernlab", importance = "permutation")
+
+
+svm_wf<- workflow() %>%
+  add_recipe(dalba_ml_rec_J1_J15_class) %>%
+  add_model(svm_spec)
+
+set.seed(345)
+tune_svm <- tune_grid(
+  svm_wf,
+  resamples = folds,
+  grid = 10,
+  metrics = metric_set(roc_auc, accuracy, f_meas)
+)
+
+best_rmse_svm <- select_best(tune_svm, metric = "f_meas")
+
+final_svm <- finalize_model(
+  svm_spec,
+  best_rmse_svm
+)
+
+final_wf_svm <- workflow() %>%
+  add_recipe(dalba_ml_rec_J1_J15_class) %>%
+  add_model(final_svm)
+
+
+set.seed(123)
+svm_rs<- fit_resamples(object = final_wf_svm, 
+                       resamples = folds_cv, 
+                       control = control_resamples(verbose=TRUE, save_pred = TRUE, save_workflow = TRUE))
+
+
+svm_rs %>% collect_metrics()
+```
+
+
+```{r}
+svm_rs %>% 
+  collect_predictions() %>%
+  conf_mat(event, .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+
+```{r}
+fit_workflow_J35_svm <- fit(final_wf_svm, dalba_ml_train_J1_J15_class)
+```
+
+
+
+
+## Random Forest
+```{r}
+rf_spec <- rand_forest(mode = "classification",
+                        mtry = tune(),
+                        trees = 1000,
+                        min_n = tune()
+                        ) %>% set_engine("ranger", importance = "permutation")
+
+
+rf_wf<- workflow() %>%
+  add_recipe(dalba_ml_rec_J1_J15_class) %>%
+  add_model(rf_spec)
+
+set.seed(345)
+
+tune_rf <- tune_grid(
+  rf_wf,
+  resamples = folds,
+  grid = 20, 
+  metrics = metric_set(roc_auc, accuracy, f_meas)
+)
+
+best_rmse_rf <- select_best(tune_rf, metric="accuracy")
+
+final_rf <- finalize_model(
+  rf_spec,
+  best_rmse_rf
+)
+
+final_wf_rf <- workflow() %>%
+  add_recipe(dalba_ml_rec_J1_J15_class) %>%
+  add_model(final_rf) %>% 
+  fit(dalba_ml_train_J1_J15_class)
+
+
+set.seed(123)
+rf_rs<- fit_resamples(object = final_wf_rf, 
+                      resamples = folds_cv, 
+                      control = control_resamples(verbose=TRUE, save_pred = TRUE, save_workflow = TRUE))
+
+
+rf_rs %>% collect_metrics()
+```
+
+
+```{r}
+fit_workflow_J35_rf <- fit(final_wf_rf, dalba_ml_train_J1_J15_class)
+```
+
+
+
+
+
+
+
+# Validation
+
+```{r}
+SVM_J35 <- fit_workflow_J35_svm
+
+
+final_res <- SVM_J35 %>%
+  augment(dalba_ml_test_J1_J15_class) %>%
+  mutate(event = as.factor(event), .pred_class = as.factor(.pred_class))
+
+
+confusion_matrix <- final_res %>%
+  conf_mat(event, .pred_class)
+
+
+confusion_matrix %>%
+  autoplot(type = "heatmap")
+
+```
+
+
+```{r}
+final_res %>% accuracy(event, .pred_class)
+```
+
+
+```{r}
+final_res %>% yardstick::sens(event, .pred_class) 
+```
+
+
+```{r}
+final_res %>% yardstick::spec(event, .pred_class)
+```
+
+
+```{r}
+final_res %>% yardstick::precision(event, .pred_class)
+```
+
+
+```{r}
+final_res %>% yardstick::npv(event, .pred_class)
+```
+
