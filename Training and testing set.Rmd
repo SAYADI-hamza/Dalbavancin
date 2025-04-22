@@ -1,0 +1,232 @@
+---
+title: "Carrothers popPK model"
+author: "Hamza Sayadi"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+# Packages
+```{r}
+library(mrgsolve)
+library(dplyr)
+library(truncnorm)
+library(writexl)
+
+```
+
+
+
+# modèle PKpop : Carrothers TJ et al., Dalbavancin Population Pharmacokinetic Modeling and Target Attainment Analysis. Clin Pharmacol Drug Dev. 2020 Jan;9(1):21-31. doi: 10.1002/cpdd.695. Epub 2019 May 14. PMID: 31087630; PMCID: PMC7003773.
+```{r}
+
+code_Carrothers <-
+"
+[SET] end=100, delta=0.1
+
+[PARAM] @annotated
+TVCL : 0.0531 : Typical value of total Clearance (L/h)
+TVV1 : 3.04   : Typical value of Central volume (L)
+Q2   : 0.288  : Value of Intercompartmental clearance 2 (L/h)
+TVV2 : 8.78   : Typical value of Peripheral volume of distribution 2 (L)
+Q3   : 2.11   : Value of Intercompartmental clearance 3 (L/h)
+TVV3 : 3.28   : Typical value of Peripheral volume of distribution 3 (L)
+
+CLALB : -0.477 : effect of albumine on CL
+CLCLCR: 0.273  : effect of creatinine clearance on CL
+CLWT  : 0.391  : effect of weight on CL
+V1ALB : -0.340 : effect of albumine on V1
+V1WT  : 0.683  : effect of weight on V1
+V2AGE : 0.486  : effect of age on V2
+V2ALB : -0.413 : effect of albumine on V2
+V2WT  : 0.365  : effect of weight on V2
+V3ALB : -0.551 : effect of albumine on V3
+V3WT  : 0.518  : effect of weight on V3
+
+ETA1 : 0 : IIV on clearance 
+ETA2 : 0 : IIV on peripheral volume 2
+ETA3 : 0 : IIV on central volume 
+ETA4 : 0 : IIV on peripheral volume 3
+
+
+[PARAM] @annotated @covariates
+DFGe: 100  : estimated creatinine clearance (ml/min/1.73 m²)
+WT  : 85.5 : weight (kg)
+ALB : 3.7  : albumine (g/dL)
+AGE : 47   : age (year)
+
+
+[OMEGA] @block
+0.0489
+0.0823 0.1530 
+0.0000 0.0000 0.0566
+0.0000 0.0000 0.1110 0.4370
+
+
+[SIGMA]
+0.0001  // proportional 0.0362
+
+
+[CMT] @annotated
+CENT    : Central compartment (mg) [ADM, OBS]
+PERIPH2 : Peripheral compartment 2 (mg)
+PERIPH3 : Peripheral compartment 3 (mg)
+
+
+[MAIN]
+double CL = (TVCL * pow(ALB/3.7, CLALB) * pow(DFGe/100, CLCLCR) * pow(WT/85.5, CLWT)) * exp(ETA1 + ETA(1)) ;
+double V1 = (TVV1 * pow(ALB/3.7, V1ALB) * pow(WT/85.5, V1WT)) * exp(ETA3 + ETA(3)) ;
+double V2 = (TVV2 * pow(AGE/47, V2AGE) * pow(ALB/3.7,  V2ALB) * pow(WT/85.5, V2WT)) * exp(ETA2 + ETA(2)) ;
+double V3  = (TVV3 * pow(ALB/3.7, V3ALB) * pow(WT/85.5, V3WT)) * exp(ETA4 + ETA(4)) ;
+
+
+[ODE]
+dxdt_CENT   =  Q2*PERIPH2/V2 + Q3*PERIPH3/V3 - CL*CENT/V1 - Q2*CENT/V1 - Q3*CENT/V1 ;
+dxdt_PERIPH2 =  Q2*CENT/V1 -Q2*PERIPH2/V2 ;
+dxdt_PERIPH3 =  Q3*CENT/V1 -Q3*PERIPH3/V3 ;
+
+
+[TABLE]
+double DV = (CENT/V1) * (1 + EPS(1)) + EPS(2);
+
+int i = 0;
+while(DV<0 && i <100) 
+{
+simeps();
+DV = (CENT/V1) * (1 + EPS(1)) + EPS(2);
+++i;
+}
+
+
+[CAPTURE] DV CL V3 V2 V1 Q3 Q2
+"
+
+Carrothers_model <- mcode("Dalba_model", code_Carrothers)
+
+
+```
+
+
+
+# MIC
+```{r}
+
+distrib_CMI <- c(16, 31, 285, 8455, 45804, 18550, 1546, 314, 41, 17, 2)
+
+sum_distrib_CMI = sum(distrib_CMI)
+prob = distrib_CMI/sum_distrib_CMI
+
+CMI_sample <- sample(c(0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.125, 0.250,0.5,1,2), 5000, replace = TRUE, prob = prob) 
+
+```
+
+
+
+
+# Simulation of 1500 mg D1/D8 
+```{r}
+set.seed(23456)
+data1 <- expand.ev(ID = 1:4425, amt = 1500, ii=168, addl =1, ss= 0, tinf=1) 
+
+set.seed(2345)
+data2 <- data1 %>% 
+  mutate(DFGe = rtruncnorm(n(), a = 22, b = 440, mean = 119, sd = 53),
+        WT = rtruncnorm(n(), a = 43, b = 320, mean = 89.5, sd = 27),
+        AGE = rtruncnorm(n(), a = 18, b = 93, mean = 47, sd = 20),
+        ALB = rtruncnorm(n(), a = 1.1, b = 5.1, mean = 3.7, sd = 0.7),
+        CMI = sample(CMI_sample))
+
+
+C_dalba_J1_J8 <- Carrothers_model %>% 
+  data_set(data2) %>%
+  Req(DV) %>%
+  mrgsim(delta = 1, end = 1344)
+
+
+C_dalba_J1_J8 <- C_dalba_J1_J8 %>%
+  group_by(ID) %>%
+  filter(!(time == 0 & row_number() == 1)) %>%
+  ungroup()
+
+
+data3 <- C_dalba_J1_J8 %>%
+  as_tibble() %>% 
+  left_join(data2 %>% select(-time, -amt:-time))
+
+  
+data_Car_dalba_J1_J8 <- data3 %>% 
+  pivot_wider(names_from = time, values_from = DV,names_prefix = "conc_time_") %>% 
+  left_join(data3 %>% select(ID, DFGe:CMI) %>% distinct(ID, .keep_all=TRUE))
+
+
+data_Car_dalba_J1_J8=select(data_Car_dalba_J1_J8, ID, DFGe, WT, AGE, ALB, CMI, conc_time_168, conc_time_336, conc_time_672, conc_time_840, conc_time_1008, conc_time_1176, conc_time_1344)
+
+
+conc_cols <- c("conc_time_672", "conc_time_840", "conc_time_1008", 
+               "conc_time_1176", "conc_time_1344")
+
+
+for (col in conc_cols) {
+  event_col <- paste0("event_", gsub("conc_time_", "", col))
+  data_Car_dalba_J1_J8[[event_col]] <- ifelse(data_Car_dalba_J1_J8$CMI * 66 > data_Car_dalba_J1_J8[[col]], "yes", "no")
+}
+
+
+```
+
+
+
+# Simulation of 1500 mg D1/D15  
+```{r}
+
+set.seed(23456)
+data4 <- expand.ev(ID = 1:4425, amt = 1500, ii=336, addl =1, ss= 0, tinf=1) 
+
+
+set.seed(2345)
+data5 <- data4 %>% 
+  mutate(DFGe = rtruncnorm(n(), a = 22, b = 440, mean = 119, sd = 53),
+        WT = rtruncnorm(n(), a = 43, b = 320, mean = 89.5, sd = 27),
+        AGE = rtruncnorm(n(), a = 18, b = 93, mean = 47, sd = 20),
+        ALB = rtruncnorm(n(), a = 1.1, b = 5.1, mean = 3.7, sd = 0.7))
+
+
+C_dalba_J1_J15 <- Carrothers_model %>% 
+  data_set(data5) %>%
+  Req(DV) %>%
+  mrgsim(delta = 1, end = 1344)
+
+
+C_dalba_J1_J15 <- C_dalba_J1_J15 %>%
+  group_by(ID) %>%
+  filter(!(time == 0 & row_number() == 1)) %>%
+  ungroup()
+
+
+data6 <- C_dalba_J1_J15 %>%
+  as_tibble() %>% 
+  left_join(data5 %>% select(-time, -amt:-evid))
+
+  
+data_Car_dalba_J1_J15 <- data6 %>% 
+  pivot_wider(names_from = time, values_from = DV,names_prefix = "conc_time_") %>% 
+  left_join(data6 %>% select(ID, DFGe:ALB) %>% distinct(ID, .keep_all=TRUE))
+
+
+data_Car_dalba_J1_J15 <- select(data_Car_dalba_J1_J15, ID, DFGe, WT, AGE, ALB,CMI, conc_time_336, conc_time_672, conc_time_840, conc_time_1008, conc_time_1176, conc_time_1344)
+
+
+conc_cols_2 <- c("conc_time_672", "conc_time_840", "conc_time_1008", 
+               "conc_time_1176", "conc_time_1344")
+
+
+for (col in conc_cols_2) {
+  event_col <- paste0("event_", gsub("conc_time_", "", col))
+  data_Car_dalba_J1_J15[[event_col]] <- ifelse(data_Car_dalba_J1_J8$CMI * 66 > data_Car_dalba_J1_J8[[col]], "yes", "no")
+}
+
+
+```
+
+
+
